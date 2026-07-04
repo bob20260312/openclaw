@@ -291,7 +291,7 @@ import {
   validateReplayTurns,
 } from "../replay-history.js";
 import { observeReplayMetadata, replayMetadataFromState } from "../replay-state.js";
-import { createEmbeddedAgentResourceLoader } from "../resource-loader.js";
+import { createEmbeddedAgentResourceLoader, shouldSkipResourceLoaderReload } from "../resource-loader.js";
 import {
   clearActiveEmbeddedRun,
   type EmbeddedAgentQueueHandle,
@@ -375,6 +375,15 @@ import {
   isPrimaryBootstrapRun,
   remapInjectedContextFilesToWorkspace,
 } from "./attempt.bootstrap-context.js";
+
+/**
+ * Yield control to the Node.js event loop so pending I/O callbacks
+ * (health checks, heartbeats, diagnostics) are not starved during
+ * long-running synchronous prep stages.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 import {
   assembleAttemptContextEngine,
   buildLoopPromptCacheInfo,
@@ -909,6 +918,7 @@ export async function runEmbeddedAttempt(
     sessionAgentId,
   });
   prepStages.mark("workspace-sandbox");
+  await yieldToEventLoop();
 
   let restoreSkillEnv: (() => void) | undefined;
   let aborted = Boolean(params.abortSignal?.aborted);
@@ -1084,6 +1094,7 @@ export async function runEmbeddedAttempt(
       eligibility: skillsEligibility,
     });
     prepStages.mark("skills");
+    await yieldToEventLoop();
 
     const sessionLabel = params.sessionKey ?? params.sessionId;
     const contextInjectionMode = resolveContextInjectionMode(params.config, sessionAgentId);
@@ -1364,6 +1375,7 @@ export async function runEmbeddedAttempt(
           return filteredTools;
         })();
     prepStages.mark("core-plugin-tools");
+    await yieldToEventLoop();
     emitCorePluginToolStageSummary("core-plugin-tools", corePluginToolStages.snapshot());
     const bootstrapHasFileAccess = toolsEnabled && toolsRaw.some((tool) => tool.name === "read");
     const bootstrapWarn = makeBootstrapWarn({
@@ -1455,6 +1467,7 @@ export async function runEmbeddedAttempt(
       },
     });
     prepStages.mark("bootstrap-context");
+    await yieldToEventLoop();
     const remappedContextFiles = remapInjectedContextFilesToWorkspace({
       files: resolvedContextFiles,
       sourceWorkspaceDir: resolvedWorkspace,
@@ -1763,6 +1776,7 @@ export async function runEmbeddedAttempt(
       toolSearchConfig.mode === "directory" &&
       toolSearch.catalogRegistered;
     prepStages.mark("bundle-tools");
+    await yieldToEventLoop();
     const explicitToolAllowlistSources = collectAttemptExplicitToolAllowlistSources({
       capabilityProfile: runtimeCapabilityProfile,
       toolsAllow: params.toolsAllow,
@@ -2064,6 +2078,7 @@ export async function runEmbeddedAttempt(
     });
     let systemPromptText = attemptSystemPrompt.systemPrompt;
     prepStages.mark("system-prompt");
+    await yieldToEventLoop();
 
     const compactionTimeoutMs = resolveCompactionTimeoutMs(params.config);
     const sessionWriteLockOptions = resolveEmbeddedAttemptSessionWriteLockOptions({
@@ -2276,7 +2291,14 @@ export async function runEmbeddedAttempt(
         settingsManager,
         extensionFactories,
       });
-      await resourceLoader.reload();
+      // Skip reload when settings files haven't changed — saves ~13s on cached runs.
+      if (shouldSkipResourceLoaderReload(resolvedWorkspace, agentDir)) {
+        log.trace(
+          `embedded run: skipped resource loader reload (cache hit): runId=${params.runId} workspace=${resolvedWorkspace}`,
+        );
+      } else {
+        await resourceLoader.reload();
+      }
       // DefaultResourceLoader.reload() rehydrates settings from disk and can drop OpenClaw
       // compaction overrides applied in createPreparedEmbeddedAgentSettingsManager — same
       // rehydration also restores OpenClaw runtime's auto-compaction (openclaw#75799), so re-apply
@@ -2288,6 +2310,7 @@ export async function runEmbeddedAttempt(
       });
       applyAgentAutoCompactionGuard(autoCompactionGuardArgs);
       prepStages.mark("session-resource-loader");
+      await yieldToEventLoop();
 
       // Get hook runner early so it's available when creating tools
       const hookRunner = getGlobalHookRunner();
