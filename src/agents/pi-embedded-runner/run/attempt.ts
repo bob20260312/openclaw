@@ -235,7 +235,10 @@ import {
   validateReplayTurns,
 } from "../replay-history.js";
 import { observeReplayMetadata, replayMetadataFromState } from "../replay-state.js";
-import { createEmbeddedPiResourceLoader } from "../resource-loader.js";
+import {
+  createEmbeddedPiResourceLoader,
+  shouldSkipResourceLoaderReload,
+} from "../resource-loader.js";
 import {
   clearActiveEmbeddedRun,
   type EmbeddedPiQueueHandle,
@@ -298,6 +301,15 @@ import {
   formatEmbeddedRunStageSummary,
   shouldWarnEmbeddedRunStageSummary,
 } from "./attempt-stage-timing.js";
+
+/**
+ * Yield control to the Node.js event loop so pending I/O callbacks
+ * (health checks, heartbeats, diagnostics) are not starved during
+ * long-running synchronous prep stages.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 import { buildAttemptSystemPrompt } from "./attempt-system-prompt.js";
 import {
   assembleAttemptContextEngine,
@@ -1224,6 +1236,7 @@ export async function runEmbeddedAttempt(
     sessionAgentId,
   });
   prepStages.mark("workspace-sandbox");
+  await yieldToEventLoop();
 
   let restoreSkillEnv: (() => void) | undefined;
   let aborted = Boolean(params.abortSignal?.aborted);
@@ -1269,6 +1282,7 @@ export async function runEmbeddedAttempt(
       agentId: sessionAgentId,
     });
     prepStages.mark("skills");
+    await yieldToEventLoop();
 
     const sessionLabel = params.sessionKey ?? params.sessionId;
     const contextInjectionMode = resolveContextInjectionMode(params.config, sessionAgentId);
@@ -1466,6 +1480,7 @@ export async function runEmbeddedAttempt(
           return filteredTools;
         })();
     prepStages.mark("core-plugin-tools");
+    await yieldToEventLoop();
     emitCorePluginToolStageSummary("core-plugin-tools", corePluginToolStages.snapshot());
     const bootstrapHasFileAccess = toolsEnabled && toolsRaw.some((tool) => tool.name === "read");
     const bootstrapWarn = makeBootstrapWarn({
@@ -1556,6 +1571,7 @@ export async function runEmbeddedAttempt(
       },
     });
     prepStages.mark("bootstrap-context");
+    await yieldToEventLoop();
     const remappedContextFiles = remapInjectedContextFilesToWorkspace({
       files: resolvedContextFiles,
       sourceWorkspaceDir: resolvedWorkspace,
@@ -1775,6 +1791,7 @@ export async function runEmbeddedAttempt(
       );
     }
     prepStages.mark("bundle-tools");
+    await yieldToEventLoop();
     const explicitToolAllowlistSources = collectAttemptExplicitToolAllowlistSources({
       config: params.config,
       sessionKey: params.sessionKey,
@@ -2055,6 +2072,7 @@ export async function runEmbeddedAttempt(
     const systemPromptOverride = attemptSystemPrompt.systemPromptOverride;
     let systemPromptText = systemPromptOverride();
     prepStages.mark("system-prompt");
+    await yieldToEventLoop();
 
     const sessionWriteLockOptions = resolveSessionWriteLockOptions(params.config, {
       maxHoldMsFallback: resolveSessionLockMaxHoldFromTimeout({
@@ -2202,7 +2220,14 @@ export async function runEmbeddedAttempt(
         settingsManager,
         extensionFactories,
       });
-      await resourceLoader.reload();
+      // Skip reload when settings files haven't changed — saves ~13s on cached runs.
+      if (shouldSkipResourceLoaderReload(resolvedWorkspace, agentDir)) {
+        log.trace(
+          `embedded run: skipped resource loader reload (cache hit): runId=${params.runId} workspace=${resolvedWorkspace}`,
+        );
+      } else {
+        await resourceLoader.reload();
+      }
       // DefaultResourceLoader.reload() rehydrates settings from disk and can drop OpenClaw
       // compaction overrides applied in createPreparedEmbeddedPiSettingsManager — same
       // rehydration also restores Pi's auto-compaction (openclaw#75799), so re-apply
@@ -2214,6 +2239,7 @@ export async function runEmbeddedAttempt(
       });
       applyPiAutoCompactionGuard(piAutoCompactionGuardArgs);
       prepStages.mark("session-resource-loader");
+      await yieldToEventLoop();
 
       // Get hook runner early so it's available when creating tools
       const hookRunner = getGlobalHookRunner();

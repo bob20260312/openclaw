@@ -1,3 +1,4 @@
+import { isEventLoopDegraded, triggerEventLoopHealthSample } from "../infra/event-loop-guard.js";
 import {
   diagnosticLogger as diag,
   logLaneDequeue,
@@ -50,6 +51,36 @@ export class GatewayDrainingError extends Error {
     this.name = "GatewayDrainingError";
   }
 }
+
+/**
+ * Dedicated error type thrown when a new command is rejected because the
+ * lane queue has exceeded its maximum depth (backpressure).
+ */
+export class CommandLaneOverflowError extends Error {
+  constructor(lane: string, depth: number, maxDepth: number) {
+    super(`Command lane "${lane}" queue overflow: depth=${depth} max=${maxDepth}`);
+    this.name = "CommandLaneOverflowError";
+  }
+}
+
+/**
+ * Dedicated error type thrown when a new command is rejected because the
+ * event loop is degraded and the gateway is shedding load.
+ */
+export class EventLoopDegradedError extends Error {
+  constructor(lane: string) {
+    super(`Command lane "${lane}" rejected: event loop degraded, shedding load`);
+    this.name = "EventLoopDegradedError";
+  }
+}
+
+/** Maximum queue depth per lane before rejecting new entries. */
+const DEFAULT_MAX_LANE_QUEUE_DEPTH = 100;
+
+/** Interval in ms to yield to the event loop during drain pump cycles. */
+const DRAIN_PUMP_YIELD_MS = 5;
+/** Number of entries to process before yielding to the event loop. */
+const DRAIN_PUMP_YIELD_EVERY = 4;
 
 // Minimal in-process queue to serialize command executions.
 // Default lane ("main") preserves the existing behavior. Additional lanes allow
@@ -335,9 +366,29 @@ function drainLane(lane: string) {
   }
   state.draining = true;
 
+  let pumpYieldCount = 0;
+
   const pump = () => {
     try {
+      // Sample event loop health once per drain cycle for adaptive load shedding.
+      triggerEventLoopHealthSample();
+
       while (state.activeTaskIds.size < state.maxConcurrent && state.queue.length > 0) {
+        // Yield to the event loop periodically to prevent starvation of
+        // health checks, I/O callbacks, and other async work during bursts.
+        if (pumpYieldCount >= DRAIN_PUMP_YIELD_EVERY) {
+          pumpYieldCount = 0;
+          state.draining = false;
+          setTimeout(() => {
+            if (!state.draining) {
+              state.draining = true;
+              pump();
+            }
+          }, DRAIN_PUMP_YIELD_MS);
+          return;
+        }
+        pumpYieldCount++;
+
         const entry = state.queue.shift() as QueueEntry;
         const waitedMs = Date.now() - entry.enqueuedAt;
         if (waitedMs >= entry.warnAfterMs) {
@@ -424,9 +475,24 @@ export function enqueueCommandInLane<T>(
   if (queueState.gatewayDraining) {
     return Promise.reject(new GatewayDrainingError());
   }
+
+  // Adaptive load shedding: reject non-essential work when event loop is degraded.
   const cleaned = normalizeLane(lane);
+  if (cleaned === CommandLane.Main && isEventLoopDegraded()) {
+    return Promise.reject(new EventLoopDegradedError(cleaned));
+  }
+
   const warnAfterMs = opts?.warnAfterMs ?? 2_000;
   const state = getLaneState(cleaned);
+
+  // Backpressure: reject new entries when queue exceeds max depth.
+  // Foreground-priority entries bypass backpressure (they displace via
+  // priority insertion in enqueueLaneEntry).
+  const maxDepth = opts?.maxQueueDepth ?? DEFAULT_MAX_LANE_QUEUE_DEPTH;
+  if (state.queue.length >= maxDepth && resolveQueuePriority(opts?.priority) <= 0) {
+    return Promise.reject(new CommandLaneOverflowError(cleaned, state.queue.length, maxDepth));
+  }
+
   return new Promise<T>((resolve, reject) => {
     enqueueLaneEntry(state, {
       task: () => task(),
