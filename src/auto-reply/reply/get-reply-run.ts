@@ -90,6 +90,31 @@ import type { TypingController } from "./typing.js";
 type AgentDefaults = NonNullable<OpenClawConfig["agents"]>["defaults"];
 type ExecOverrides = Pick<ExecToolDefaults, "host" | "security" | "ask" | "node">;
 
+function appendCurrentInboundContextText(params: {
+  currentInboundContext:
+    | {
+        text: string;
+        promptJoiner?: "\n\n" | "\n" | " ";
+      }
+    | undefined;
+  extraText: string | undefined;
+}): { text: string; promptJoiner?: "\n\n" | "\n" | " " } | undefined {
+  const extraText = normalizeOptionalString(params.extraText);
+  if (!extraText) {
+    return params.currentInboundContext;
+  }
+  if (!params.currentInboundContext) {
+    return {
+      text: extraText,
+      promptJoiner: "\n\n",
+    };
+  }
+  return {
+    ...params.currentInboundContext,
+    text: [params.currentInboundContext.text, extraText].filter(Boolean).join("\n\n"),
+  };
+}
+
 export function resolvePromptSilentReplyConversationType(params: {
   ctx: Pick<
     MsgContext,

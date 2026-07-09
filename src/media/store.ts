@@ -18,7 +18,10 @@ import { basenameFromAnyPath, extnameFromAnyPath, nameFromAnyPath } from "./file
 import { detectMime, extensionForMime } from "./mime.js";
 import { isFsSafeError, readLocalFileSafely, type FsSafeLikeError } from "./store.runtime.js";
 
-const resolveMediaDir = () => path.join(resolveConfigDir(), "media");
+const resolveMediaDir = () => {
+  const override = normalizeOptionalString(process.env.OPENCLAW_MEDIA_DIR);
+  return override ? path.resolve(override) : path.join(resolveConfigDir(), "media");
+};
 export const MEDIA_MAX_BYTES = 5 * 1024 * 1024; // 5MB default
 const MAX_BYTES = MEDIA_MAX_BYTES;
 const DEFAULT_TTL_MS = 2 * 60 * 1000; // 2 minutes

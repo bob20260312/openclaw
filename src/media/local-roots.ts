@@ -11,6 +11,7 @@ import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { resolveConfigDir, resolveUserPath } from "../utils.js";
 import { isPassThroughRemoteMediaSource } from "./media-source-url.js";
+import { getMediaDir } from "./store.js";
 
 type BuildMediaLocalRootsOptions = {
   preferredTmpDir?: string;
@@ -38,6 +39,7 @@ export function buildMediaLocalRoots(
   return Array.from(
     new Set([
       preferredTmpDir,
+      path.resolve(getMediaDir()),
       path.join(resolvedConfigDir, "media"),
       path.join(resolvedStateDir, "media"),
       path.join(resolvedStateDir, "canvas"),

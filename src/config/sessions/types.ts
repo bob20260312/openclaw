@@ -124,6 +124,14 @@ export type SessionPluginJsonValue =
   | SessionPluginJsonValue[]
   | { [key: string]: SessionPluginJsonValue };
 
+export type RecentContractAttachment = {
+  path: string;
+  fileName: string;
+  mimeType?: string;
+  sourceChannel?: string;
+  capturedAt: number;
+};
+
 export type SessionPluginNextTurnInjection = {
   id: string;
   pluginId: string;
@@ -311,6 +319,8 @@ export type SessionEntry = {
   pendingFinalDeliveryContext?: DeliveryContext;
   /** Durable send intent backing pending final delivery, when already created. */
   pendingFinalDeliveryIntentId?: string | null;
+  /** Recent contract attachment for contract-analyst follow-up review flows. */
+  recentContractAttachment?: RecentContractAttachment;
   /**
    * Whether totalTokens reflects a fresh context snapshot for the latest run.
    * Undefined means legacy/unknown freshness; false forces consumers to treat

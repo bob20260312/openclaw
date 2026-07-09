@@ -251,6 +251,10 @@ export function startGatewayConfigReloader(opts: {
       forceChangedPaths: pluginInstallWholeRecordPaths,
     });
     if (isNoopReloadPlan(plan) && !followUp.requiresRestart) {
+      opts.log.info(
+        `config change requires runtime snapshot refresh only (${changedPaths.join(", ")})`,
+      );
+      await opts.onHotReload(plan, nextConfig);
       return;
     }
     if (settings.mode === "off") {

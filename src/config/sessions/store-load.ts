@@ -60,6 +60,38 @@ function normalizeOptionalStringOrNull(value: unknown): string | null | undefine
   return undefined;
 }
 
+function normalizeRecentContractAttachment(
+  value: unknown,
+): SessionEntry["recentContractAttachment"] {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const path = typeof value.path === "string" ? value.path.trim() : "";
+  const fileName = typeof value.fileName === "string" ? value.fileName.trim() : "";
+  if (!path || !fileName) {
+    return undefined;
+  }
+  const capturedAt =
+    typeof value.capturedAt === "number" &&
+    Number.isFinite(value.capturedAt) &&
+    value.capturedAt >= 0
+      ? value.capturedAt
+      : 0;
+  const mimeType =
+    typeof value.mimeType === "string" && value.mimeType.trim() ? value.mimeType.trim() : undefined;
+  const sourceChannel =
+    typeof value.sourceChannel === "string" && value.sourceChannel.trim()
+      ? value.sourceChannel.trim()
+      : undefined;
+  return {
+    path,
+    fileName,
+    capturedAt,
+    ...(mimeType ? { mimeType } : {}),
+    ...(sourceChannel ? { sourceChannel } : {}),
+  };
+}
+
 function normalizeRecordKey(value: string): string | undefined {
   const key = value.trim();
   return key.length > 0 ? key : undefined;
@@ -139,6 +171,10 @@ function normalizePendingFinalDeliveryFields(entry: SessionEntry): SessionEntry 
   assign(
     "pendingFinalDeliveryIntentId",
     normalizeOptionalStringOrNull(entry.pendingFinalDeliveryIntentId),
+  );
+  assign(
+    "recentContractAttachment",
+    normalizeRecentContractAttachment(entry.recentContractAttachment),
   );
 
   return next;

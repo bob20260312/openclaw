@@ -7,6 +7,10 @@ import {
   listChannelPlugins,
 } from "../channels/plugins/index.js";
 import type { ChannelAccountSnapshot } from "../channels/plugins/types.public.js";
+import {
+  getRuntimeConfigSnapshotMetadata,
+  resolveRuntimeConfigCacheKey,
+} from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { startChannelApprovalHandlerBootstrap } from "../infra/approval-handler-bootstrap.js";
 import { type BackoffPolicy, computeBackoff, sleepWithAbort } from "../infra/backoff.js";
@@ -21,6 +25,7 @@ import {
 import { withPluginHttpRouteRegistry } from "../plugins/http-registry.js";
 import type { PluginRegistry } from "../plugins/registry.js";
 import { resolveAccountEntry, resolveNormalizedAccountEntry } from "../routing/account-lookup.js";
+import { listBindings } from "../routing/bindings.js";
 import {
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
@@ -93,6 +98,51 @@ function resolveDefaultRuntime(channelId: ChannelId): ChannelAccountSnapshot {
 
 function cloneDefaultRuntime(channelId: ChannelId, accountId: string): ChannelAccountSnapshot {
   return { ...resolveDefaultRuntime(channelId), accountId };
+}
+
+function resolveWechatDefaultAccountId(cfg: OpenClawConfig): string | null {
+  const channels = cfg.channels;
+  if (!channels || typeof channels !== "object") {
+    return null;
+  }
+  const channelConfig = channels["openclaw-weixin"];
+  if (!channelConfig || typeof channelConfig !== "object") {
+    return null;
+  }
+  const explicit =
+    typeof channelConfig.defaultAccount === "string" ? channelConfig.defaultAccount.trim() : "";
+  if (explicit) {
+    return explicit;
+  }
+  const accounts = channelConfig.accounts;
+  if (!accounts || typeof accounts !== "object") {
+    return null;
+  }
+  for (const accountId of Object.keys(accounts)) {
+    const normalized = accountId.trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function summarizeWechatBindings(cfg: OpenClawConfig): Array<{
+  agentId: string | null;
+  accountId: string | null;
+  dmScope: string | null;
+}> {
+  return listBindings(cfg)
+    .filter((binding) => binding?.match?.channel === "openclaw-weixin")
+    .slice(0, 20)
+    .map((binding) => ({
+      agentId: typeof binding.agentId === "string" ? binding.agentId : null,
+      accountId:
+        typeof binding.match?.accountId === "string" && binding.match.accountId.trim()
+          ? binding.match.accountId.trim()
+          : "default",
+      dmScope: typeof binding.session?.dmScope === "string" ? binding.session.dmScope : null,
+    }));
 }
 
 async function waitForChannelStopGracefully(task: Promise<unknown> | undefined, timeoutMs: number) {
@@ -380,6 +430,7 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     }
     const { preserveRestartAttempts = false, preserveManualStop = false } = opts;
     const cfg = getRuntimeConfig();
+    const channelLog = ensureChannelLog(channelId);
     resetDirectoryCache({ channel: channelId, accountId });
     const store = getStore(channelId);
     const accountIds = accountId
@@ -392,6 +443,19 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
     }
     if (accountIds.length === 0) {
       return;
+    }
+    if (channelId === "openclaw-weixin") {
+      const snapshotMetadata = getRuntimeConfigSnapshotMetadata();
+      channelLog.info("route config snapshot before channel start", {
+        requestedAccountId: accountId ?? null,
+        startupAccountIds: accountIds,
+        defaultAccountId: resolveWechatDefaultAccountId(cfg),
+        runtimeCacheKey: resolveRuntimeConfigCacheKey(cfg),
+        runtimeRevision: snapshotMetadata?.revision ?? null,
+        runtimeFingerprint: snapshotMetadata?.fingerprint ?? null,
+        runtimeSourceFingerprint: snapshotMetadata?.sourceFingerprint ?? null,
+        wechatBindings: summarizeWechatBindings(cfg),
+      });
     }
 
     const startup = await runTasksWithConcurrency({
@@ -417,7 +481,7 @@ export function createChannelManager(opts: ChannelManagerOptions): ChannelManage
         const abort = new AbortController();
         store.aborts.set(id, abort);
         let handedOffTask = false;
-        const log = ensureChannelLog(channelId);
+        const log = channelLog;
         const runtime = ensureChannelRuntime(channelId);
         let scopedChannelRuntime: ReturnType<typeof createTaskScopedChannelRuntime> | null = null;
         let channelRuntimeForTask: ChannelRuntimeSurface | undefined;
