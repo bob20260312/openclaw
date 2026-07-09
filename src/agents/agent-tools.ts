@@ -1080,10 +1080,33 @@ export function createOpenClawCodingTools(options?: {
     localModelLeanPreserveToolNames,
   });
   options?.recordToolPrepStage?.("model-provider-policy");
+
+  // When an agent has a narrow tool profile, pre-filter the tool list
+  // before the policy pipeline. This avoids running every policy layer plus
+  // schema normalization and hook wrapping on tools that the profile or
+  // inherited policy will drop anyway. Two sources:
+  //   1. inheritedToolPolicy.allow — parent session's effective allowlist (subagents)
+  //   2. profilePolicyWithAlsoAllow.allow — agent's own profile (e.g. "minimal")
+  const profileAllow = profilePolicyWithAlsoAllow?.allow;
+  const inheritedAllow = inheritedToolPolicy?.allow;
+  const preFilterAllowlist =
+    inheritedAllow && inheritedAllow.length > 0
+      ? inheritedAllow
+      : profileAllow && profileAllow.length > 0
+        ? profileAllow
+        : undefined;
+
+  const toolsForPolicyPipeline = preFilterAllowlist
+    ? (() => {
+        const allowed = new Set(preFilterAllowlist.map((n) => normalizeToolName(n)));
+        return toolsForModelProvider.filter((tool) => allowed.has(normalizeToolName(tool.name)));
+      })()
+    : toolsForModelProvider;
+
   // Sender identity is carried for command/channel-action auth; tool visibility
   // comes from configured tool policies, not per-turn sender ownership.
   const subagentFiltered = applyToolPolicyPipeline({
-    tools: toolsForModelProvider,
+    tools: toolsForPolicyPipeline,
     toolMeta: (tool) => getPluginToolMeta(tool),
     warn: logWarn,
     steps: [
