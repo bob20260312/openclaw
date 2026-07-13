@@ -114,6 +114,7 @@ export const DEFAULT_INPUT_IMAGE_MIMES = [
   "image/heif",
 ];
 /** Default MIME allowlist for input_file text/PDF extraction. */
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 export const DEFAULT_INPUT_FILE_MIMES = [
   "text/plain",
   "text/markdown",
@@ -121,6 +122,7 @@ export const DEFAULT_INPUT_FILE_MIMES = [
   "text/csv",
   "application/json",
   "application/pdf",
+  DOCX_MIME,
 ];
 /** Default decoded-byte cap for input_image payloads. */
 export const DEFAULT_INPUT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -140,6 +142,26 @@ export const DEFAULT_INPUT_PDF_MAX_PIXELS = 4_000_000;
 export const DEFAULT_INPUT_PDF_MIN_TEXT_CHARS = 200;
 const NORMALIZED_INPUT_IMAGE_MIME = "image/jpeg";
 const HEIC_INPUT_IMAGE_MIMES = new Set(["image/heic", "image/heif"]);
+const DOCX_XML_ENTITY = /&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);/gi;
+const DOCX_XML_TAG = /<[^>]+>/g;
+const DOCX_XML_LINE_BREAK_TAG = /<(?:w:br|w:cr)\b[^>]*\/>/gi;
+const DOCX_XML_TAB_TAG = /<w:tab\b[^>]*\/>/gi;
+const DOCX_XML_PARAGRAPH_END_TAG = /<\/w:p>/gi;
+const DOCX_XML_ROW_END_TAG = /<\/w:tr>/gi;
+const DOCX_XML_CELL_END_TAG = /<\/w:tc>/gi;
+const DOCX_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
+const DOCX_PART_LOAD_ORDER = [
+  "word/document.xml",
+  "word/footnotes.xml",
+  "word/endnotes.xml",
+  "word/comments.xml",
+] as const;
+
+type JSZipObjectWithSize = {
+  _data?: {
+    uncompressedSize?: number;
+  };
+};
 
 function rejectOversizedBase64Payload(params: {
   data: string;
@@ -341,15 +363,128 @@ async function normalizeInputImage(params: {
 async function resolveInputFileMime(params: {
   buffer: Buffer;
   declaredMime?: string;
+  filePath?: string;
 }): Promise<string | undefined> {
-  const sniffedMime = normalizeMimeType(await detectMime({ buffer: params.buffer }));
+  const sniffedMime = normalizeMimeType(
+    await detectMime({
+      buffer: params.buffer,
+      headerMime: params.declaredMime,
+      filePath: params.filePath,
+    }),
+  );
   if (!sniffedMime) {
     return params.declaredMime;
+  }
+  if (
+    (sniffedMime === "application/octet-stream" || sniffedMime === "application/zip") &&
+    params.declaredMime === DOCX_MIME
+  ) {
+    return DOCX_MIME;
   }
   if (sniffedMime === "application/octet-stream") {
     return params.declaredMime ?? sniffedMime;
   }
   return sniffedMime;
+}
+
+/** Extracts and normalizes an input_image source from base64 or guarded URL input. */
+function decodeXmlEntity(entity: string): string {
+  switch (entity.toLowerCase()) {
+    case "&amp;":
+      return "&";
+    case "&lt;":
+      return "<";
+    case "&gt;":
+      return ">";
+    case "&quot;":
+      return '"';
+    case "&apos;":
+      return "'";
+    default:
+      break;
+  }
+  if (/^&#x[0-9a-f]+;$/i.test(entity)) {
+    const codePoint = Number.parseInt(entity.slice(3, -1), 16);
+    return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : entity;
+  }
+  if (/^&#\d+;$/i.test(entity)) {
+    const codePoint = Number.parseInt(entity.slice(2, -1), 10);
+    return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : entity;
+  }
+  return entity;
+}
+
+function decodeDocxXmlText(xml: string): string {
+  const withStructure = xml
+    .replace(DOCX_XML_TAB_TAG, "\t")
+    .replace(DOCX_XML_LINE_BREAK_TAG, "\n")
+    .replace(DOCX_XML_CELL_END_TAG, "\t")
+    .replace(DOCX_XML_ROW_END_TAG, "\n")
+    .replace(DOCX_XML_PARAGRAPH_END_TAG, "\n\n");
+  const withoutTags = withStructure.replace(DOCX_XML_TAG, "");
+  const decoded = withoutTags.replace(DOCX_XML_ENTITY, (entity) => decodeXmlEntity(entity));
+  return decoded
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function resolveOrderedDocxParts(fileNames: string[]): string[] {
+  const ordered = new Set<string>();
+  for (const partName of DOCX_PART_LOAD_ORDER) {
+    if (fileNames.includes(partName)) {
+      ordered.add(partName);
+    }
+  }
+  for (const prefix of ["word/header", "word/footer"] as const) {
+    for (const fileName of fileNames
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".xml"))
+      .sort()) {
+      ordered.add(fileName);
+    }
+  }
+  return [...ordered];
+}
+
+async function extractDocxContent(params: { buffer: Buffer; maxChars: number }): Promise<string> {
+  const { default: JSZip } = await import("jszip");
+  const zip = await JSZip.loadAsync(params.buffer);
+  const partNames = resolveOrderedDocxParts(Object.keys(zip.files));
+  const segments: string[] = [];
+  let totalBytes = 0;
+
+  for (const partName of partNames) {
+    const entry = zip.file(partName);
+    if (!entry || entry.dir) {
+      continue;
+    }
+    const hintedSize = (entry as unknown as JSZipObjectWithSize)._data?.uncompressedSize;
+    if (
+      typeof hintedSize === "number" &&
+      Number.isFinite(hintedSize) &&
+      hintedSize > DOCX_MAX_ENTRY_BYTES
+    ) {
+      throw new Error(`DOCX part too large: ${partName}`);
+    }
+    const xml = await entry.async("string");
+    const xmlBytes = Buffer.byteLength(xml, "utf8");
+    totalBytes += xmlBytes;
+    if (xmlBytes > DOCX_MAX_ENTRY_BYTES || totalBytes > DOCX_MAX_ENTRY_BYTES * 2) {
+      throw new Error("DOCX content too large to extract safely");
+    }
+    const text = decodeDocxXmlText(xml);
+    if (!text) {
+      continue;
+    }
+    segments.push(text);
+    if (segments.join("\n\n").length >= params.maxChars) {
+      break;
+    }
+  }
+
+  return clampText(segments.join("\n\n").trim(), params.maxChars);
 }
 
 /** Extracts and normalizes an input_image source from base64 or guarded URL input. */
@@ -449,7 +584,11 @@ export async function extractFileContentFromSource(params: {
     throw new Error(`File too large: ${buffer.byteLength} bytes (limit: ${limits.maxBytes} bytes)`);
   }
 
-  mimeType = await resolveInputFileMime({ buffer, declaredMime: mimeType });
+  mimeType = await resolveInputFileMime({
+    buffer,
+    declaredMime: mimeType,
+    filePath: source.filename,
+  });
 
   if (!mimeType) {
     throw new Error("input_file missing media type");
@@ -479,6 +618,14 @@ export async function extractFileContentFromSource(params: {
       text,
       images: extracted.images.length > 0 ? extracted.images : undefined,
     };
+  }
+
+  if (mimeType === DOCX_MIME) {
+    const text = await extractDocxContent({
+      buffer,
+      maxChars: limits.maxChars,
+    });
+    return { filename, text };
   }
 
   const text = clampText(decodeTextContent(buffer, charset), limits.maxChars);

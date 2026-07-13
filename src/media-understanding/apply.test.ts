@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import JSZip from "jszip";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type { OpenClawConfig } from "../config/types.js";
@@ -180,6 +181,50 @@ async function createTempMediaFile(params: { fileName: string; content: Buffer |
   await fs.writeFile(mediaPath, params.content);
   tempMediaFileCache.set(cacheKey, mediaPath);
   return mediaPath;
+}
+
+async function createDocxFixture(params: {
+  fileName?: string;
+  documentText: string;
+  footnoteText?: string;
+}) {
+  const zip = new JSZip();
+  zip.file(
+    "[Content_Types].xml",
+    [
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+      '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
+      params.footnoteText
+        ? '<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>'
+        : "",
+      "</Types>",
+    ].join(""),
+  );
+  zip.file(
+    "word/document.xml",
+    [
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
+      "<w:body>",
+      `<w:p><w:r><w:t>${params.documentText}</w:t></w:r></w:p>`,
+      "</w:body>",
+      "</w:document>",
+    ].join(""),
+  );
+  if (params.footnoteText) {
+    zip.file(
+      "word/footnotes.xml",
+      [
+        '<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
+        `<w:footnote w:id="1"><w:p><w:r><w:t>${params.footnoteText}</w:t></w:r></w:p></w:footnote>`,
+        "</w:footnotes>",
+      ].join(""),
+    );
+  }
+  const buffer = await zip.generateAsync({ type: "nodebuffer" });
+  return await createTempMediaFile({
+    fileName: params.fileName ?? "sample.docx",
+    content: buffer,
+  });
 }
 
 async function createMockExecutable(dir: string, name: string) {
@@ -1955,6 +2000,24 @@ describe("applyMediaUnderstanding", () => {
       expectFileNotApplied({ ctx, result, body: "<media:file>" });
     },
   );
+
+  it("extracts text from docx attachments", async () => {
+    const filePath = await createDocxFixture({
+      documentText: "Project scope and milestones",
+      footnoteText: "Footnote detail",
+    });
+
+    const { ctx, result } = await applyWithDisabledMedia({
+      body: "<media:file>",
+      mediaPath: filePath,
+      mediaType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+
+    expect(result.appliedFile).toBe(true);
+    expect(ctx.Body).toContain('<file name="sample.docx"');
+    expect(ctx.Body).toContain("Project scope and milestones");
+    expect(ctx.Body).toContain("Footnote detail");
+  });
 
   it("keeps vendor +json attachments eligible for text extraction", async () => {
     const filePath = await createTempMediaFile({

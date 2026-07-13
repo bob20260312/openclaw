@@ -99,7 +99,6 @@ export async function resolveAgentTurnAttachments(params: {
   const resultIndexes: number[] = [];
   const resolvedHistoryImages: RecentInboundHistoryImage[] = [];
   const resolveImageAttachment = async (attachment: MediaAttachment): Promise<boolean> => {
-    const mediaType = attachment.mime ?? "application/octet-stream";
     if (!isImageAgentTurnAttachment(attachment)) {
       return false;
     }
@@ -107,11 +106,12 @@ export async function resolveAgentTurnAttachments(params: {
       return false;
     }
     try {
-      const { buffer } = await cache.getBuffer({
+      const { buffer, mime } = await cache.getBuffer({
         attachmentIndex: attachment.index,
         maxBytes: AGENT_TURN_ATTACHMENT_MAX_BYTES,
         timeoutMs: AGENT_TURN_ATTACHMENT_TIMEOUT_MS,
       });
+      const mediaType = mime ?? attachment.mime ?? "application/octet-stream";
       results.push({
         mediaType,
         data: buffer.toString("base64"),

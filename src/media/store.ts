@@ -25,7 +25,10 @@ import { writeSiblingTempFile } from "../infra/sibling-temp-file.js";
 import { resolveConfigDir } from "../utils.js";
 import { isFsSafeError, readLocalFileSafely, type FsSafeLikeError } from "./store.runtime.js";
 
-const resolveMediaDir = () => path.join(resolveConfigDir(), "media");
+const resolveMediaDir = () => {
+  const override = normalizeOptionalString(process.env.OPENCLAW_MEDIA_DIR);
+  return override ? path.resolve(override) : path.join(resolveConfigDir(), "media");
+};
 /** Default per-file media-store byte cap used by inbound staging and plugin SDK callers. */
 export const MEDIA_MAX_BYTES = 5 * 1024 * 1024;
 const MAX_BYTES = MEDIA_MAX_BYTES;

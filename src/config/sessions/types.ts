@@ -141,6 +141,14 @@ export type SessionPluginJsonValue =
   | SessionPluginJsonValue[]
   | { [key: string]: SessionPluginJsonValue };
 
+export type RecentContractAttachment = {
+  path: string;
+  fileName: string;
+  mimeType?: string;
+  sourceChannel?: string;
+  capturedAt: number;
+};
+
 export type SessionPluginNextTurnInjection = {
   id: string;
   pluginId: string;
@@ -371,6 +379,8 @@ export type SessionEntry = {
   restartRecoveryDeliveryContext?: DeliveryContext;
   /** Active run id that owns restartRecoveryDeliveryContext cleanup. */
   restartRecoveryDeliveryRunId?: string;
+  /** Recent contract attachment for contract-analyst follow-up review flows. */
+  recentContractAttachment?: RecentContractAttachment;
   /**
    * Whether totalTokens reflects a fresh context snapshot for the latest run.
    * Undefined means legacy/unknown freshness; false forces consumers to treat

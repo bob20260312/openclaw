@@ -6,6 +6,7 @@ import { normalizeChatType } from "../channels/chat-type.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { shouldLogVerbose } from "../globals.js";
 import { logDebug } from "../logger.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   normalizeRouteBindingId,
   normalizeRouteBindingRoles,
@@ -214,6 +215,7 @@ const resolvedRouteCacheByCfg = new WeakMap<
   }
 >();
 const MAX_RESOLVED_ROUTE_CACHE_KEYS = 4000;
+const wechatRouteLog = createSubsystemLogger("routing/openclaw-weixin");
 
 type EvaluatedBindingsIndex = {
   byPeer: Map<string, EvaluatedBinding[]>;
@@ -562,6 +564,33 @@ function formatRoleIdsCacheKey(roleIds: string[]): string {
   return roleIds.toSorted().join(",");
 }
 
+function formatRoutePeerForLog(peer?: RoutePeer | null): string {
+  return peer?.kind && peer?.id ? `${peer.kind}:${peer.id}` : "none";
+}
+
+function summarizeWechatResolvedBindings(bindings: EvaluatedBinding[]): Array<{
+  agentId: string | null;
+  accountPattern: string;
+  peer: string;
+  dmScope: string | null;
+}> {
+  return bindings.slice(0, 20).map((entry) => {
+    const peer =
+      entry.match.peer.state === "valid"
+        ? `${entry.match.peer.kind}:${entry.match.peer.id}`
+        : entry.match.peer.state === "wildcard-kind"
+          ? `${entry.match.peer.kind}:*`
+          : entry.match.peer.state;
+    return {
+      agentId: typeof entry.binding.agentId === "string" ? entry.binding.agentId : null,
+      accountPattern: entry.match.accountPattern || "default",
+      peer,
+      dmScope:
+        typeof entry.binding.session?.dmScope === "string" ? entry.binding.session.dmScope : null,
+    };
+  });
+}
+
 function buildResolvedRouteCacheKey(params: {
   channel: string;
   accountId: string;
@@ -624,6 +653,7 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
   const dmScope = input.cfg.session?.dmScope ?? "main";
   const identityLinks = input.cfg.session?.identityLinks;
   const shouldLogDebug = shouldLogVerbose();
+  const shouldLogWechatRoute = channel === "openclaw-weixin";
   const parentPeer = input.parentPeer
     ? {
         kind: normalizeChatType(input.parentPeer.kind) ?? input.parentPeer.kind,
@@ -648,6 +678,17 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
   if (routeCache && routeCacheKey) {
     const cachedRoute = routeCache.get(routeCacheKey);
     if (cachedRoute) {
+      if (shouldLogWechatRoute) {
+        wechatRouteLog.info("resolved route cache hit", {
+          accountId,
+          peer: formatRoutePeerForLog(peer),
+          parentPeer: formatRoutePeerForLog(parentPeer),
+          routeCacheKey,
+          selectedAgentId: cachedRoute.agentId,
+          selectedSessionKey: cachedRoute.sessionKey,
+          matchedBy: cachedRoute.matchedBy,
+        });
+      }
       return { ...cachedRoute };
     }
   }
@@ -692,11 +733,23 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
         routeCache.set(routeCacheKey, route);
       }
     }
+    if (shouldLogWechatRoute) {
+      wechatRouteLog.info("resolved route", {
+        accountId,
+        peer: formatRoutePeerForLog(peer),
+        parentPeer: formatRoutePeerForLog(parentPeer),
+        matchedBy,
+        selectedAgentId: resolvedAgentId,
+        selectedSessionKey: sessionKey,
+        effectiveDmScope,
+        routeCacheKey: routeCacheKey || null,
+        bindings: summarizeWechatResolvedBindings(bindings),
+      });
+    }
     return route;
   };
 
-  const formatPeer = (value?: RoutePeer | null) =>
-    value?.kind && value?.id ? `${value.kind}:${value.id}` : "none";
+  const formatPeer = (value?: RoutePeer | null) => formatRoutePeerForLog(value);
   const formatNormalizedPeer = (value: NormalizedPeerConstraint) => {
     if (value.state === "none") {
       return "none";

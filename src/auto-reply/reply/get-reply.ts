@@ -1,5 +1,7 @@
 // Main auto-reply pipeline: prepares context, runs commands, and dispatches agents.
 import fs from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import {
@@ -16,12 +18,16 @@ import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { DEFAULT_AGENT_WORKSPACE_DIR, ensureAgentWorkspace } from "../../agents/workspace.js";
 import { resolveChannelModelOverride } from "../../channels/model-overrides.js";
 import { type OpenClawConfig, getRuntimeConfig } from "../../config/config.js";
+import { resolveStorePath } from "../../config/sessions/paths.js";
+import { updateSessionStoreEntry } from "../../config/sessions/store.js";
 import { logVerbose } from "../../globals.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { ApplyMediaUnderstandingResult } from "../../media-understanding/apply.js";
 import type { ExtractedFileImage } from "../../media-understanding/extracted-file-images.js";
+import { normalizeAttachments } from "../../media-understanding/attachments.normalize.js";
+import { MEDIA_MAX_BYTES, saveMediaBuffer } from "../../media/store.js";
 import {
   buildAgentHookContextChannelFields,
   buildAgentHookContextIdentityFields,
@@ -67,6 +73,364 @@ import {
   resolveStoredModelOverride,
 } from "./stored-model-override.js";
 import { createTypingController } from "./typing.js";
+
+const CONTRACT_ANALYST_ID = "contract-analyst";
+const CONTRACT_REVIEW_PATH = `/api/v1/agents/${CONTRACT_ANALYST_ID}/contract-review`;
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const CONTRACT_REVIEW_INTENT_PATTERNS = [
+  "审查",
+  "审核",
+  "审一下",
+  "风险",
+  "高亮",
+  "问题清单",
+  "修改建议",
+  "红线",
+  "批注",
+  "review",
+  "revise",
+  "highlight",
+  "check contract",
+];
+
+type ContractReviewApiSuccess = {
+  summary: string;
+  highlighted_filename: string;
+  highlighted_download_url: string;
+  severity_counts: Record<string, number>;
+  findings: Array<{
+    severity: string;
+    clause_title: string;
+    rule_id: string;
+    evidence_text: string;
+    comment: string;
+    suggestion: string;
+  }>;
+};
+
+function normalizeContractIntentText(ctx: MsgContext): string {
+  return (
+    normalizeOptionalString(ctx.BodyForAgent) ??
+    normalizeOptionalString(ctx.CommandBody) ??
+    normalizeOptionalString(ctx.RawBody) ??
+    normalizeOptionalString(ctx.Body) ??
+    ""
+  ).trim();
+}
+
+function hasAnyKeyword(text: string, keywords: readonly string[]): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return keywords.some((keyword) => normalized.includes(keyword.toLowerCase()));
+}
+
+function isContractReviewIntent(text: string): boolean {
+  return hasAnyKeyword(text, CONTRACT_REVIEW_INTENT_PATTERNS);
+}
+
+function isEmptyContractFollowupText(text: string): boolean {
+  return text.trim().length === 0 || text.trim() === "[用户上传了附件]";
+}
+
+async function maybeHandleContractAnalystUploadAck(params: {
+  agentId: string;
+  ctx: MsgContext;
+  sessionKey?: string;
+  cfg: OpenClawConfig;
+}): Promise<ReplyPayload | undefined> {
+  if (params.agentId !== CONTRACT_ANALYST_ID) {
+    return undefined;
+  }
+  const text = normalizeContractIntentText(params.ctx);
+  if (!isEmptyContractFollowupText(text)) {
+    return undefined;
+  }
+  const attachments = normalizeAttachments(params.ctx);
+  const inboundDocx = attachments.find((attachment) =>
+    isDocxPath(attachment.path, attachment.mime),
+  );
+  const inboundDocxPath = normalizeOptionalString(inboundDocx?.path);
+  if (!inboundDocxPath) {
+    return undefined;
+  }
+  const resolvedInboundDocxPath = resolveContractAttachmentPath(
+    inboundDocxPath,
+    normalizeOptionalString(params.ctx.MediaWorkspaceDir) ?? undefined,
+  );
+  const storePath = params.sessionKey
+    ? resolveStorePath(params.cfg.session?.store, { agentId: params.agentId })
+    : undefined;
+  await rememberRecentContractAttachment({
+    storePath,
+    sessionKey: params.sessionKey,
+    filePath: resolvedInboundDocxPath,
+    fileName: path.basename(resolvedInboundDocxPath),
+    mimeType: normalizeOptionalString(inboundDocx?.mime) ?? undefined,
+    sourceChannel:
+      normalizeOptionalString(params.ctx.OriginatingChannel ?? params.ctx.Provider) ?? undefined,
+  });
+  return {
+    text: "我已收到文件，请描述你的需求吧。",
+  };
+}
+
+function isDocxPath(filePath?: string, mimeType?: string): boolean {
+  const normalizedPath = normalizeOptionalString(filePath)?.toLowerCase();
+  const normalizedMime = normalizeOptionalString(mimeType)?.toLowerCase();
+  return normalizedPath?.endsWith(".docx") === true || normalizedMime === DOCX_MIME;
+}
+
+function resolveContractAttachmentPath(filePath: string, mediaWorkspaceDir?: string): string {
+  if (path.isAbsolute(filePath)) {
+    return filePath;
+  }
+  if (mediaWorkspaceDir) {
+    return path.resolve(mediaWorkspaceDir, filePath);
+  }
+  return path.resolve(filePath);
+}
+
+async function rememberRecentContractAttachment(params: {
+  storePath?: string;
+  sessionKey?: string;
+  filePath: string;
+  fileName: string;
+  mimeType?: string;
+  sourceChannel?: string;
+}): Promise<void> {
+  if (!params.storePath || !params.sessionKey) {
+    return;
+  }
+  await updateSessionStoreEntry({
+    storePath: params.storePath,
+    sessionKey: params.sessionKey,
+    update: async () => ({
+      recentContractAttachment: {
+        path: params.filePath,
+        fileName: params.fileName,
+        capturedAt: Date.now(),
+        ...(params.mimeType ? { mimeType: params.mimeType } : {}),
+        ...(params.sourceChannel ? { sourceChannel: params.sourceChannel } : {}),
+      },
+    }),
+  });
+}
+
+function buildContractReviewSummaryReply(params: {
+  result: ContractReviewApiSuccess;
+  highlightedMediaPath: string;
+}): ReplyPayload {
+  const lines: string[] = [
+    "合同审查已完成。",
+    params.result.summary,
+    "",
+    `高风险：${params.result.severity_counts.HIGH ?? 0}`,
+    `中风险：${params.result.severity_counts.MEDIUM ?? 0}`,
+    `低风险：${params.result.severity_counts.LOW ?? 0}`,
+  ];
+  if (params.result.findings.length > 0) {
+    lines.push("", "问题清单：");
+    for (const [index, finding] of params.result.findings.entries()) {
+      lines.push(
+        `${index + 1}. [${finding.severity}] ${finding.clause_title} / ${finding.rule_id}`,
+      );
+      lines.push(`证据：${finding.evidence_text}`);
+      lines.push(`问题：${finding.comment}`);
+      lines.push(`建议：${finding.suggestion}`);
+      lines.push("");
+    }
+  }
+  return {
+    text: lines.join("\n").trim(),
+    mediaUrl: params.highlightedMediaPath,
+  };
+}
+
+async function postMultipartContractReview(params: {
+  fileBuffer: Buffer;
+  fileName: string;
+  note: string;
+}): Promise<ContractReviewApiSuccess> {
+  const baseUrl =
+    normalizeOptionalString(process.env.AGENT_CHAT_SERVICE_URL) ?? "http://agent-chat-service:8104";
+  const endpoint = new URL(CONTRACT_REVIEW_PATH, baseUrl);
+  const boundary = `----openclaw-contract-review-${Date.now().toString(16)}`;
+  const fileHeader = Buffer.from(
+    `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${params.fileName}"\r\n` +
+      `Content-Type: ${DOCX_MIME}\r\n\r\n`,
+    "utf8",
+  );
+  const notePart = Buffer.from(
+    `\r\n--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="note"\r\n\r\n` +
+      `${params.note}\r\n` +
+      `--${boundary}--\r\n`,
+    "utf8",
+  );
+  const body = Buffer.concat([fileHeader, params.fileBuffer, notePart]);
+  return await new Promise<ContractReviewApiSuccess>((resolve, reject) => {
+    const req = httpRequest(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          "Content-Length": String(body.byteLength),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          if ((res.statusCode ?? 500) >= 400) {
+            reject(new Error(`contract-review failed (${res.statusCode ?? 500}): ${raw}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(raw) as ContractReviewApiSuccess);
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function downloadContractArtifact(params: {
+  downloadUrl: string;
+  fileName: string;
+}): Promise<string> {
+  const baseUrl =
+    normalizeOptionalString(process.env.AGENT_CHAT_SERVICE_URL) ?? "http://agent-chat-service:8104";
+  const artifactUrl = new URL(params.downloadUrl, baseUrl);
+  const buffer = await new Promise<Buffer>((resolve, reject) => {
+    const req = httpRequest(artifactUrl, { method: "GET" }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      res.on("end", () => {
+        if ((res.statusCode ?? 500) >= 400) {
+          reject(new Error(`contract artifact download failed (${res.statusCode ?? 500})`));
+          return;
+        }
+        resolve(Buffer.concat(chunks));
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+  const saved = await saveMediaBuffer(
+    buffer,
+    DOCX_MIME,
+    "outbound",
+    MEDIA_MAX_BYTES,
+    params.fileName,
+    params.fileName,
+  );
+  return saved.path;
+}
+
+async function maybeHandleContractAnalystReview(params: {
+  agentId: string;
+  ctx: MsgContext;
+  sessionEntry: {
+    recentContractAttachment?: {
+      path: string;
+      fileName: string;
+      mimeType?: string;
+    };
+  };
+  sessionKey?: string;
+  storePath?: string;
+}): Promise<ReplyPayload | undefined> {
+  if (params.agentId !== CONTRACT_ANALYST_ID) {
+    return undefined;
+  }
+  const text = normalizeContractIntentText(params.ctx);
+  const attachments = normalizeAttachments(params.ctx);
+  const inboundDocx = attachments.find((attachment) =>
+    isDocxPath(attachment.path, attachment.mime),
+  );
+  const inboundDocxPath = normalizeOptionalString(inboundDocx?.path);
+  const resolvedInboundDocxPath = inboundDocxPath
+    ? resolveContractAttachmentPath(
+        inboundDocxPath,
+        normalizeOptionalString(params.ctx.MediaWorkspaceDir) ?? undefined,
+      )
+    : undefined;
+
+  if (resolvedInboundDocxPath) {
+    await rememberRecentContractAttachment({
+      storePath: params.storePath,
+      sessionKey: params.sessionKey,
+      filePath: resolvedInboundDocxPath,
+      fileName: path.basename(resolvedInboundDocxPath),
+      mimeType: normalizeOptionalString(inboundDocx?.mime) ?? undefined,
+      sourceChannel:
+        normalizeOptionalString(params.ctx.OriginatingChannel ?? params.ctx.Provider) ?? undefined,
+    });
+  }
+
+  const recentAttachment = resolvedInboundDocxPath
+    ? {
+        path: resolvedInboundDocxPath,
+        fileName: path.basename(resolvedInboundDocxPath),
+        mimeType: normalizeOptionalString(inboundDocx?.mime) ?? undefined,
+      }
+    : params.sessionEntry.recentContractAttachment;
+
+  if (!recentAttachment) {
+    if (!text) {
+      return {
+        text: "请先上传一份 .docx 合同文件，再告诉我你想审查、摘要还是解释其中的条款。",
+      };
+    }
+    if (!isContractReviewIntent(text)) {
+      return undefined;
+    }
+    return {
+      text: "请先上传一份 .docx 合同文件，我才能继续做合同摘要、条款解释或风险审查。",
+    };
+  }
+
+  if (!isContractReviewIntent(text)) {
+    return undefined;
+  }
+
+  try {
+    const fileBuffer = await fs.readFile(recentAttachment.path);
+    const reviewResult = await postMultipartContractReview({
+      fileBuffer,
+      fileName: recentAttachment.fileName,
+      note: text,
+    });
+    const highlightedMediaPath = await downloadContractArtifact({
+      downloadUrl: reviewResult.highlighted_download_url,
+      fileName: reviewResult.highlighted_filename,
+    });
+    return buildContractReviewSummaryReply({
+      result: reviewResult,
+      highlightedMediaPath,
+    });
+  } catch (error) {
+    return {
+      text:
+        `合同审查暂时失败：${formatErrorMessage(error)}\n` +
+        "如果这是之前上传的文件，请重新上传一次 .docx 合同后再试。",
+    };
+  }
+}
 
 type ResetCommandAction = "new" | "reset";
 
@@ -414,6 +778,18 @@ export async function getReplyFromConfig(
     return nativeSlashCommandFastReply.reply;
   }
 
+  const contractUploadAckReply = await traceGetReplyPhase("reply.contract_upload_ack", () =>
+    maybeHandleContractAnalystUploadAck({
+      agentId,
+      ctx: finalized,
+      sessionKey: agentSessionKey ?? undefined,
+      cfg,
+    }),
+  );
+  if (contractUploadAckReply) {
+    return contractUploadAckReply;
+  }
+
   const workspace = await traceGetReplyPhase("reply.ensure_workspace", async () =>
     useFastTestBootstrap
       ? (await fs.mkdir(workspaceDirRaw, { recursive: true }), { dir: workspaceDirRaw })
@@ -575,6 +951,19 @@ export async function getReplyFromConfig(
       defaultModel,
       aliasIndex,
     });
+  }
+
+  const contractReviewReply = await traceGetReplyPhase("reply.contract_review_bridge", () =>
+    maybeHandleContractAnalystReview({
+      agentId,
+      ctx: finalized,
+      sessionEntry,
+      sessionKey,
+      storePath,
+    }),
+  );
+  if (contractReviewReply) {
+    return contractReviewReply;
   }
 
   const channelModelOverride = cfg.channels?.modelByChannel
