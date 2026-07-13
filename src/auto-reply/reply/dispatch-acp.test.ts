@@ -999,6 +999,48 @@ describe("tryDispatchAcpReply", () => {
     }
   });
 
+  it("prefers detected concrete image mime over wildcard hints", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "dispatch-acp-image-mime-"));
+    const currentPath = path.join(tempDir, "current.png");
+    try {
+      await fs.writeFile(currentPath, "current-image");
+      const result = await resolveAgentTurnAttachments({
+        cfg: createAcpTestConfig(),
+        ctx: buildTestCtx({
+          Provider: "discord",
+          Surface: "discord",
+          MediaPath: currentPath,
+          MediaType: "image/*",
+        }),
+        runtime: {
+          MediaAttachmentCache: class {
+            async getBuffer() {
+              return {
+                buffer: Buffer.from("current-image"),
+                mime: "image/png",
+                fileName: "current.png",
+                size: "current-image".length,
+              };
+            }
+          } as unknown as typeof import("./dispatch-acp-media.runtime.js").MediaAttachmentCache,
+          isMediaUnderstandingSkipError: (_error: unknown): _error is MediaUnderstandingSkipError =>
+            false,
+          normalizeAttachments: (ctx) => [{ path: ctx.MediaPath, mime: ctx.MediaType, index: 0 }],
+          resolveMediaAttachmentLocalRoots: () => [tempDir],
+        },
+      });
+
+      expect(result.attachments).toEqual([
+        {
+          mediaType: "image/png",
+          data: Buffer.from("current-image").toString("base64"),
+        },
+      ]);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps history attachment indexes distinct from sparse current media indexes", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "dispatch-acp-sparse-history-"));
     const currentPath = path.join(tempDir, "current.png");

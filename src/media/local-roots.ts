@@ -12,6 +12,7 @@ import type { OpenClawConfig } from "../config/types.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 import { resolveConfigDir } from "../utils.js";
 import { resolveLocalMediaPath } from "./local-media-path.js";
+import { getMediaDir } from "./store.js";
 
 type BuildMediaLocalRootsOptions = {
   preferredTmpDir?: string;
@@ -40,6 +41,7 @@ export function buildMediaLocalRoots(
   return Array.from(
     new Set([
       preferredTmpDir,
+      path.resolve(getMediaDir()),
       path.join(resolvedConfigDir, "media"),
       path.join(resolvedStateDir, "media"),
       path.join(resolvedStateDir, "canvas"),
